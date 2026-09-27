@@ -5,6 +5,6 @@
   "scripts": {
     "dev": "python -m http.server 8000 --directory dist",
     "start": "python -m http.server 8000 --directory dist",
-    "test": "node tests/mpeRules.test.js && node tests/repeatabilityRules.test.js"
+    "test": "node tests/mpeRules.test.js && node tests/repeatabilityRules.test.js && node tests/eccentricityRules.test.js && node tests/tareRules.test.js && node tests/zeroRules.test.js && node tests/creepRules.test.js && node tests/zeroReturnRules.test.js"
   }
 }

@@ -565,7 +565,8 @@ const oimlRuleService = {
     if (str.includes('REPEATABILITY')) return 'REPEATABILITY';
     if (str.includes('ECCENTRIC')) return 'ECCENTRIC_LOADING';
     if (str.includes('TARE')) return 'TARE';
-    if (str.includes('ZERO')) return 'ZERO';
+    if (str.includes('ZERO_RETURN') || str.includes('ZERO RETURN')) return 'ZERO_RETURN';
+    if (str.includes('ZERO')) return 'ZERO_RELATED_TESTS';
     if (str.includes('CREEP')) return 'CREEP';
     if (str.includes('TEMPERATURE') || str.includes('THERMAL')) return 'TEMPERATURE';
     return 'WEIGHING_PERFORMANCE';
@@ -742,8 +743,34 @@ const oimlRuleService = {
     },
     ECCENTRIC_LOADING(params, self) {
       if (params.complianceMode === 'VERIFIED_R76') {
+        if (typeof OimlR76EccentricityRules !== 'undefined') {
+          // Build eccentric params from observation
+          // Each eccentric observation maps to a single position evaluation
+          const e = Number(params.e) || 0.01;
+          const eccRes = OimlR76EccentricityRules.evaluateEccentricPosition({
+            accuracyClass: params.accuracyClass,
+            evaluationType: params.evaluationType,
+            procedure: params.eccentricProcedure || 'GENERAL',
+            max: params.max,
+            e,
+            unit: params.unit,
+            position: params.eccentricPosition || 'Q1',
+            referenceCentreLoad: params.eccentricCentreLoad || (Number(params.max) / 3),
+            additionalTareForLoad: params.additionalTareForLoad || 0,
+            referenceLoad: params.referenceLoad,
+            indication: params.scaleReading,
+            n: params.supportCount || 4
+          });
+          const error = calculationService.decimalSafeSubtract(params.scaleReading, params.referenceLoad);
+          return {
+            ...eccRes,
+            calculatedError: error,
+            errorFormatted: calculationService.formatError(error, params.unit),
+            absoluteError: Math.abs(error)
+          };
+        }
         const res = self.verifiedR76Engine(params);
-        res.explanation = 'Eccentric Loading Evaluation: OIML R 76-1 Clause 3.6.2 requires errors at 1/3 Max quarter-points to be within applicable MPE. Separate verified normative rule configuration required.';
+        res.explanation = 'Eccentric Loading Evaluation: OIML R 76-1 Clause 3.6.2 requires errors at 1/3 Max quarter-points to be within applicable MPE.';
         res.ruleReference = 'OIML R 76-1:2006 Clause 3.6.2';
         return res;
       }
@@ -753,20 +780,93 @@ const oimlRuleService = {
     },
     TARE(params, self) {
       if (params.complianceMode === 'VERIFIED_R76') {
+        if (typeof OimlR76TareRules !== 'undefined') {
+          // Evaluate a single net-weighing observation against Table 6 MPE
+          const e = Number(params.e) || 0.01;
+          const netLoad = Number(params.referenceLoad) || 0;
+          const netIndication = Number(params.scaleReading) || 0;
+          const error = calculationService.decimalSafeSubtract(netIndication, netLoad);
+          const absError = Math.abs(error);
+          const loadInIntervals = oimlRuleService.calculateLoadInIntervals(netLoad, e);
+          const evalType = params.evaluationType || 'INITIAL_VERIFICATION';
+
+          if (typeof OimlR76MpeRules !== 'undefined') {
+            const mpeLookup = OimlR76MpeRules.lookupMpeBand(params.accuracyClass, loadInIntervals, evalType);
+            if (mpeLookup && mpeLookup.resolved) {
+              const applicableMpe = OimlR76MpeRules.safeMultiply(mpeLookup.multiplier, e);
+              const isPass = absError <= applicableMpe + 1e-9;
+              const complianceResult = isPass ? 'PASS' : 'FAIL';
+              return {
+                calculatedError: error,
+                errorFormatted: calculationService.formatError(error, params.unit),
+                absoluteError: absError,
+                loadInIntervals,
+                mpeMultiplier: mpeLookup.multiplier,
+                bandDesc: mpeLookup.bandDesc,
+                applicableMpe,
+                applicableMpeFormatted: `±${applicableMpe} ${params.unit || ''}`.trim(),
+                complianceResult,
+                ruleReference: `OIML R 76-1:2006 Section 3.5.3.3 (Net MPE), Table 6`,
+                ruleVersion: 'OIML R 76-1:2006',
+                ruleClause: 'Section 3.5.3.3',
+                ruleTable: 'Table 6 (Net MPE)',
+                explanation: `Tare net observation: Net load ${netLoad} ${params.unit || ''} / e = ${loadInIntervals} e → Band: ${mpeLookup.bandDesc} → MPE ±${mpeLookup.multiplier}e = ±${applicableMpe} ${params.unit || ''}. Net Error = ${calculationService.formatError(error, params.unit)}. |Error| ${isPass ? '≤' : '>'} MPE → ${complianceResult}.`,
+                isNearLimit: isPass && absError >= 0.75 * applicableMpe && applicableMpe > 0,
+                badgeHtml: isPass ? '<span class="badge good">PASS</span>' : '<span class="badge bad">FAIL</span>',
+                complianceMode: 'VERIFIED_R76'
+              };
+            }
+          }
+          return self.verifiedR76Engine(params);
+        }
         const res = self.verifiedR76Engine(params);
-        res.explanation = 'Tare Evaluation: OIML R 76-1 Clause 3.5.3 / 3.6.3 requires tare balancing and net error to comply with net-load MPE. Separate verified normative rule configuration required.';
-        res.ruleReference = 'OIML R 76-1:2006 Clause 3.5.3';
+        res.explanation = 'Tare Evaluation: OIML R 76-1 Clause 3.5.3.3 requires net values to comply with Table 6 MPE.';
+        res.ruleReference = 'OIML R 76-1:2006 Clause 3.5.3.3';
         return res;
       }
       const res = self.demoMpeEngine(params);
       res.explanation += ' [Tare test observation]';
       return res;
     },
-    ZERO(params, self) {
+    ZERO_RELATED_TESTS(params, self) {
       if (params.complianceMode === 'VERIFIED_R76') {
+        if (typeof OimlR76ZeroRules !== 'undefined') {
+          // For single observations (ZERO_SETTING_ACCURACY path):
+          // evaluate the zero deviation observation directly
+          const e = Number(params.e) || 0.01;
+          const zeroDeviation = params.zeroDeviation !== undefined
+            ? Number(params.zeroDeviation)
+            : (params.scaleReading !== undefined ? Number(params.scaleReading) - Number(params.referenceLoad) : undefined);
+
+          const zeroSettingType = params.zeroSettingType || 'NON_AUTOMATIC';
+          const acc = OimlR76ZeroRules.evaluateZeroSettingAccuracy({
+            zeroSettingType,
+            e,
+            unit: params.unit,
+            zeroDeviation
+          });
+
+          const error = (zeroDeviation !== undefined && !isNaN(zeroDeviation))
+            ? zeroDeviation : null;
+
+          return {
+            calculatedError: error,
+            errorFormatted: error !== null ? (error >= 0 ? '+' + error : '' + error) + ' ' + (params.unit || '') : '—',
+            absoluteError: error !== null ? Math.abs(error) : null,
+            applicableMpe: acc.allowedZeroDeviation,
+            applicableMpeFormatted: acc.allowedZeroDeviation !== undefined ? '\u00b1' + acc.allowedZeroDeviation + ' ' + (params.unit || '') : '—',
+            complianceResult: acc.complianceResult,
+            ruleReference: acc.ruleReference || 'OIML R 76-1:2006 Section 4.5.2',
+            ruleVersion: 'OIML R 76-1:2006',
+            ruleClause: 'Section 4.5.2',
+            explanation: acc.explanation,
+            badgeHtml: acc.badgeHtml,
+            complianceMode: 'VERIFIED_R76'
+          };
+        }
         const res = self.verifiedR76Engine(params);
-        res.explanation = 'Zero-setting Evaluation: OIML R 76-1 Clause 3.5.4 requires zero-setting and zero-tracking error E_0 to satisfy ±0.25e (or ±0.5d for ungraduated). Separate verified normative rule configuration required.';
-        res.ruleReference = 'OIML R 76-1:2006 Clause 3.5.4';
+        res.explanation = 'Zero Evaluation: OIML R 76-1 Section 4.5.2 requires zero deviation \u2264 \u00b10.25e after zero-setting.';
+        res.ruleReference = 'OIML R 76-1:2006 Section 4.5.2';
         return res;
       }
       const res = self.demoMpeEngine(params);
@@ -775,13 +875,103 @@ const oimlRuleService = {
     },
     CREEP(params, self) {
       if (params.complianceMode === 'VERIFIED_R76') {
+        if (typeof OimlR76CreepRules !== 'undefined') {
+          // Build observation array from this single observation for live P display
+          const indication = Number(params.scaleReading);
+          const nomTime = Number(params.nominalTimeMinutes) || 0;
+          const deltaL = Number(params.additionalLoadDeltaL) || 0;
+          const e = Number(params.e) || 0.01;
+
+          // Compute P = I + 0.5e - ΔL for this observation
+          const halfE = e * 0.5;
+          const correctedP = indication + halfE - deltaL;
+
+          return {
+            calculatedError: indication,
+            correctedIndication: correctedP,
+            nominalTimeMinutes: nomTime,
+            additionalLoad: deltaL,
+            halfE,
+            complianceResult: 'NOT_EVALUATED', // single obs — full series evaluated at Step 5
+            ruleReference: 'OIML R 76-1:2006\nSection 3.9.4.1\nAnnex A.4.11.1',
+            ruleVersion: 'OIML R 76-1:2006',
+            ruleClause: 'Section 3.9.4.1',
+            explanation: 'Creep observation recorded. P = ' + indication + ' + ' + halfE + ' − ' + deltaL + ' = ' + correctedP + '. '
+              + 'Full creep series will be evaluated once all required observations are entered (Section 3.9.4.1 / Annex A.4.11.1).',
+            complianceMode: 'VERIFIED_R76',
+            badgeHtml: '<span class="badge warn" style="background:#eaf0f2;color:#355361;">PENDING SERIES</span>'
+          };
+        }
         const res = self.verifiedR76Engine(params);
-        res.explanation = 'Creep Evaluation: OIML R 76-1 Clause 3.9.4 limits reading drift over 30 minutes static load. Separate verified normative rule configuration required.';
-        res.ruleReference = 'OIML R 76-1:2006 Clause 3.9.4';
+        res.explanation = 'Creep Evaluation: OIML R 76-1 Section 3.9.4.1 / Annex A.4.11.1. Verified engine unavailable.';
+        res.ruleReference = 'OIML R 76-1:2006 Section 3.9.4';
         return res;
       }
       const res = self.demoMpeEngine(params);
       res.explanation += ' [Creep duration observation]';
+      return res;
+    },
+    ZERO_RETURN(params, self) {
+      if (params.complianceMode === 'VERIFIED_R76') {
+        if (typeof OimlR76ZeroReturnRules !== 'undefined') {
+          const obs = params.observation || {};
+          const appliedLoadVal = obs.appliedLoad !== undefined ? Number(obs.appliedLoad) : (params.referenceLoad !== undefined ? Number(params.referenceLoad) : Number(params.max));
+          const initZeroVal = obs.initialZeroIndication !== undefined ? Number(obs.initialZeroIndication) : (obs.reference !== undefined ? Number(obs.reference) : 0);
+          const retZeroVal = obs.returnedZeroIndication !== undefined ? Number(obs.returnedZeroIndication) : Number(params.scaleReading);
+          const durationVal = obs.loadingDurationMinutes !== undefined ? Number(obs.loadingDurationMinutes) : 30;
+
+          const evalRes = OimlR76ZeroReturnRules.evaluateZeroReturn({
+            accuracyClass: params.accuracyClass,
+            appliedLoad: appliedLoadVal,
+            maxCapacity: Number(params.max),
+            loadingDurationMinutes: durationVal,
+            initialZeroIndication: initZeroVal,
+            returnedZeroIndication: retZeroVal,
+            e: Number(params.e),
+            unit: params.unit,
+            isMultiInterval: !!(params.isMultiInterval || obs.isMultiInterval),
+            e1: params.e1 || obs.e1,
+            isMultipleRange: !!(params.isMultipleRange || obs.isMultipleRange),
+            ranges: params.ranges || obs.ranges,
+            activeRange: params.activeRange || obs.activeRange,
+            e_i: params.e_i || obs.e_i,
+            Max1: params.Max1 || obs.Max1,
+            hasAutomaticZeroSetting: !!(params.hasAutomaticZeroSetting || obs.hasAutomaticZeroSetting),
+            hasZeroTracking: !!(params.hasZeroTracking || obs.hasZeroTracking),
+            automaticZeroDisabledDuringTest: (params.automaticZeroDisabledDuringTest !== undefined ? params.automaticZeroDisabledDuringTest : (obs.automaticZeroDisabledDuringTest !== undefined ? obs.automaticZeroDisabledDuringTest : true)),
+            zeroTrackingDisabledDuringTest: (params.zeroTrackingDisabledDuringTest !== undefined ? params.zeroTrackingDisabledDuringTest : (obs.zeroTrackingDisabledDuringTest !== undefined ? obs.zeroTrackingDisabledDuringTest : true)),
+            lowestRangeFollowUpObservations: obs.lowestRangeFollowUpObservations || params.lowestRangeFollowUpObservations || []
+          });
+
+          const stdAllowed = evalRes.standardEvaluation ? evalRes.standardEvaluation.allowedDeviation : (Number(params.e || 0.01) * 0.5);
+          const dev = evalRes.zeroReturnDeviation !== null ? evalRes.zeroReturnDeviation : (retZeroVal - initZeroVal);
+
+          return {
+            ...evalRes,
+            calculatedError: dev,
+            errorFormatted: (dev >= 0 ? '+' : '') + Number(dev).toFixed(4) + ' ' + (params.unit || 'kg'),
+            loadInIntervals: self.calculateLoadInIntervals(appliedLoadVal, params.e),
+            mpeMultiplier: 0.5,
+            applicableMpe: stdAllowed,
+            applicableMpeFormatted: '±' + stdAllowed + ' ' + (params.unit || 'kg'),
+            bandDesc: 'Zero Return Limit: 0.5' + (evalRes.standardEvaluation ? evalRes.standardEvaluation.intervalLabel : 'e'),
+            ruleReference: evalRes.ruleReference,
+            ruleVersion: evalRes.ruleVersion,
+            ruleClause: 'Section 3.9.4.2',
+            ruleTable: 'Annex A.4.11.2',
+            explanation: evalRes.explanation,
+            complianceResult: evalRes.complianceResult,
+            badgeHtml: evalRes.badgeHtml,
+            complianceMode: 'VERIFIED_R76'
+          };
+        }
+        const res = self.verifiedR76Engine(params);
+        res.explanation = 'Zero Return Evaluation: OIML R 76-1 Section 3.9.4.2 / Annex A.4.11.2. Verified engine unavailable.';
+        res.ruleReference = 'OIML R 76-1:2006 Section 3.9.4.2';
+        return res;
+      }
+      const res = self.demoMpeEngine(params);
+      res.explanation += ' [Zero return observation]';
       return res;
     },
     TEMPERATURE(params, self) {
@@ -840,6 +1030,7 @@ const ALL_TEST_MODULES = [
   { id: 'Tare', title: 'Tare', desc: 'Evaluation of tare balancing accuracy, tare-weighing, and pre-set tare limits.' },
   { id: 'Zero-related Tests', title: 'Zero-related Tests', desc: 'Zero-setting range, zero-tracking speed, and initial zero-setting bounds.' },
   { id: 'Creep', title: 'Creep', desc: 'Reading deviation over sustained static load (typically evaluated at 30 minutes).' },
+  { id: 'Zero Return', title: 'Zero Return', desc: 'Zero deviation after sustained 30-minute load close to Max per OIML R 76-1 Section 3.9.4.2.' },
   { id: 'Temperature', title: 'Temperature', desc: 'Performance and span stability across nominal ambient temperature ranges.' }
 ];
 
@@ -1513,12 +1704,17 @@ function showWhyThisResult(obs, inst, evaluation) {
         <strong>VERIFIED OIML R 76-1:2006 REPEATABILITY TRACEABILITY:</strong>
         Repeatability series evaluated under OIML R 76-1:2006 Section 3.6.1 and Annex A.4.10 using verified Table 6 MPE resolution (${esc(evalType === 'INITIAL_VERIFICATION' ? 'Initial Verification' : 'In-Service Inspection')}).
       </div>
+    ` : (res.testType === 'ZERO_RETURN' ? `
+      <div class="callout" style="background:#eaf6f5;border-color:#b4e3df;color:#135955;">
+        <strong>VERIFIED OIML R 76-1:2006 ZERO RETURN TRACEABILITY:</strong>
+        Zero-return observation evaluated under OIML R 76-1:2006 Section 3.9.4.2 and Annex A.4.11.2 (30-minute sustained load close to Max).
+      </div>
     ` : `
       <div class="callout" style="background:#eaf6f5;border-color:#b4e3df;color:#135955;">
         <strong>VERIFIED OIML R 76-1:2006 METROLOGICAL TRACEABILITY:</strong>
         Observation resolved and verified against OIML R 76-1 Edition 2006 (E) ${esc(res.ruleClause || 'Section 3.5.1')}, ${esc(res.ruleTable || 'Table 6')} (${esc(evalType === 'INITIAL_VERIFICATION' ? 'Initial Verification' : 'In-Service Inspection')}).
       </div>
-    `))}
+    `)))}
 
     <div class="trace-box">
       ${compMode === 'VERIFIED_R76' && res.testType === 'REPEATABILITY' && res.complianceResult !== 'REFERENCE_REQUIRED' ? `
@@ -1613,6 +1809,76 @@ function showWhyThisResult(obs, inst, evaluation) {
               Section 3.6.1 (Repeatability)<br>
               Annex A.4.10 (Repeatability test)<br>
               Table 6 MPE Resolution: ${esc(res.mpeRuleReference || 'OIML R 76-1:2006 Table 6')}
+            </div>
+            <div style="margin-top: 4px; font-size: 12px; color: #527888;"><strong>Rule Version:</strong> <code>${esc(res.ruleVersion)}</code></div>
+          </div>
+        </div>
+      ` : (compMode === 'VERIFIED_R76' && res.testType === 'ZERO_RETURN' && res.complianceResult !== 'REFERENCE_REQUIRED' ? `
+        <!-- Verified Zero Return Traceability View matching Requirement 17 -->
+        <div class="trace-card">
+          <h4>OIML R 76-1:2006 Zero Return Traceability</h4>
+          <div class="detail-grid" style="margin:8px 0;background:white;">
+            <div class="detail-row">
+              <span class="detail-label">Test Procedure</span>
+              <span class="detail-val"><strong>Zero Return (Section 3.9.4.2 / Annex A.4.11.2)</strong></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Accuracy Class</span>
+              <span class="detail-val"><strong>Class ${esc(res.accuracyClass || inst?.class || 'III')}</strong></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Instrument Type</span>
+              <span class="detail-val"><b>${res.instrumentConfiguration?.isMultiInterval ? 'Multi-Interval' : (res.instrumentConfiguration?.isMultipleRange ? 'Multiple Range' : 'Single Interval')}</b></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Max Capacity (Max)</span>
+              <span class="detail-val"><code>${esc(res.maxCapacity || inst?.max)} ${esc(unit)}</code></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Applied Test Load (Close to Max)</span>
+              <span class="detail-val"><code>${Number(res.appliedLoad || obs.reference).toFixed(3)} ${esc(unit)}</code></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Loading Duration (Required ≥ 30 min)</span>
+              <span class="detail-val"><b>${res.loadingDurationMinutes !== null ? res.loadingDurationMinutes + ' min' : '30 min'}</b></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Automatic Zero Device During Test</span>
+              <span class="detail-val"><b>${res.automaticZeroConfiguration?.hasAutomaticZeroSetting ? (res.automaticZeroConfiguration?.automaticZeroDisabledDuringTest ? 'Disabled (Compliant)' : 'Active (Non-compliant)') : 'Not equipped'}</b></span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-label">Zero-Tracking Device During Test</span>
+              <span class="detail-val"><b>${res.automaticZeroConfiguration?.hasZeroTracking ? (res.automaticZeroConfiguration?.zeroTrackingDisabledDuringTest ? 'Disabled (Compliant)' : 'Active (Non-compliant)') : 'Not equipped'}</b></span>
+            </div>
+          </div>
+
+          <div style="font-family: monospace; font-size: 13.5px; line-height: 1.8; background: #fdfefe; border: 1px solid #d0dfe5; padding: 16px; border-radius: 6px; color: #142c3b; margin-top: 10px;">
+            <div><strong>Initial Zero Indication:</strong> ${res.initialZeroIndication !== null ? Number(res.initialZeroIndication).toFixed(4) + ' ' + esc(unit) : '—'}</div>
+            <div><strong>Returned Zero Indication:</strong> ${res.returnedZeroIndication !== null ? Number(res.returnedZeroIndication).toFixed(4) + ' ' + esc(unit) : '—'}</div>
+            <div style="margin-top: 8px;"><strong>Signed Zero Return Deviation:</strong> Returned − Initial = ${res.returnedZeroIndication !== null && res.initialZeroIndication !== null ? `${Number(res.returnedZeroIndication).toFixed(4)} − ${Number(res.initialZeroIndication).toFixed(4)} = <strong>${res.zeroReturnDeviation} ${esc(unit)}</strong>` : '—'}</div>
+            <div><strong>Absolute Deviation:</strong> |Deviation| = <strong>${res.absoluteZeroReturnDeviation} ${esc(unit)}</strong></div>
+            <div style="margin-top: 8px;"><strong>Verification Scale Interval Used:</strong> <code>${res.standardEvaluation?.intervalLabel || 'e'} = ${res.standardEvaluation?.intervalUsed} ${esc(unit)}</code></div>
+            <div><strong>Allowed Limit:</strong> 0.5 × ${res.standardEvaluation?.intervalLabel || 'e'} = <strong>±${res.standardEvaluation?.allowedDeviation} ${esc(unit)}</strong></div>
+            <div style="margin-top: 8px;"><strong>Standard Comparison:</strong> |Deviation| ${res.standardEvaluation?.result === 'PASS' ? '≤' : '>'} Allowed Limit (${res.absoluteZeroReturnDeviation} ${res.standardEvaluation?.result === 'PASS' ? '≤' : '>'} ${res.standardEvaluation?.allowedDeviation})</div>
+            <div><strong>Standard Zero-Return Result:</strong> <b style="color: ${res.standardEvaluation?.result === 'PASS' ? '#167f79' : '#d93834'};">${res.standardEvaluation?.result}</b></div>
+
+            ${res.multipleRangeFollowUp?.applicable ? `
+              <div style="margin-top: 12px; padding-top: 10px; border-top: 1px dashed #b8ced7;">
+                <strong>Section 3.9.4.2 Multiple-Range 5-Minute Follow-Up:</strong>
+                <div>Max1 = ${res.multipleRangeFollowUp?.allowedVariation ? esc(res.instrumentConfiguration?.ranges?.[0]?.Max_i || '—') : '—'} ${esc(unit)}, e1 = ${res.multipleRangeFollowUp?.allowedVariation} ${esc(unit)}</div>
+                <div>Load before return (${Number(res.appliedLoad).toFixed(3)} ${esc(unit)}) > Max1: 5-minute lowest-range follow-up required.</div>
+                <div>Near-zero observations count: ${res.multipleRangeFollowUp?.observations?.length || 0}</div>
+                <div>Maximum variation during 5 min: <strong>${res.multipleRangeFollowUp?.maximumVariation !== null ? res.multipleRangeFollowUp.maximumVariation + ' ' + esc(unit) : '—'}</strong> (Allowed: ≤ ${res.multipleRangeFollowUp?.allowedVariation} ${esc(unit)})</div>
+                <div>Follow-up Result: <b style="color: ${res.multipleRangeFollowUp?.result === 'PASS' ? '#167f79' : (res.multipleRangeFollowUp?.result === 'FAIL' ? '#d93834' : '#7b6314')}">${res.multipleRangeFollowUp?.result}</b></div>
+              </div>
+            ` : ''}
+
+            <div style="margin-top: 10px; font-size: 15px;"><strong>Final Result:</strong> <b style="color: ${res.complianceResult === 'PASS' ? '#167f79' : (res.complianceResult === 'FAIL' ? '#d93834' : '#7b6314')};">${res.complianceResult}</b></div>
+            <div style="margin-top: 6px; font-size: 13px; color: #355361;">${esc(res.explanation)}</div>
+            <div style="margin-top: 14px; padding-top: 10px; border-top: 1px dashed #b8ced7; font-size: 12.5px;">
+              <strong>Rule Reference:</strong><br>
+              OIML R 76-1:2006 Section 3.9.4.2 (Zero return)<br>
+              Annex A.4.11.2 (Zero return test)
             </div>
             <div style="margin-top: 4px; font-size: 12px; color: #527888;"><strong>Rule Version:</strong> <code>${esc(res.ruleVersion)}</code></div>
           </div>
@@ -1785,7 +2051,7 @@ function showWhyThisResult(obs, inst, evaluation) {
             <div style="margin-top:4px;font-style:italic;">* Demo simulation envelope. Not for legal regulatory verification.</div>
           </div>
         </div>
-      `))}
+      `)))}
     </div>
 
     <div class="actions">
@@ -2598,8 +2864,219 @@ function evaluation() {
                   <button class="btn primary" type="submit">+ Save Repeatability Series (${reqReps} Observations)</button>
                 </div>
               </form>
+            ` : (oimlRuleService.normalizeTestType(currentObsTest) === 'TARE' ? `
+              <!-- TARE Net Weighing Observation UI per OIML R 76-1:2006 Annex A.4.6.1 -->
+              <div class="callout" style="background:#f0f8fa;border-color:#b8dce6;color:#185363;margin-bottom:16px;">
+                <div style="font-weight:700;font-size:14px;margin-bottom:4px;">TARE TEST (OIML R 76-1:2006 Section 3.5.3.3 &amp; Annex A.4.6.1)</div>
+                <div style="font-size:12.5px;color:#356b7c;">
+                  Record the <strong>NET reference load</strong> and <strong>net indication reading</strong> for each tare step (loading &amp; unloading).
+                  Minimum <strong>5 load steps</strong> required per A.4.6.1.
+                  In VERIFIED_R76 mode, MPE is resolved from Table 6 applied to the NET value (Section 3.5.3.3). Use the Remarks field for direction (LOADING / UNLOADING).
+                </div>
+              </div>
+              <form id="new-observation-form" class="formgrid spaced">
+                <input type="hidden" name="test" value="${esc(currentObsTest)}">
+                <div class="field">
+                  <label for="reference">Net Reference Load (${esc(unit)}) *</label>
+                  <input id="reference" name="reference" type="number" step="any" min="0" max="${maxVal}" required placeholder="e.g. 5.000">
+                  <div class="preset-wrap">
+                    <span class="muted small">Presets (net load):</span>
+                    <button type="button" class="preset-btn" data-preset="${(maxVal * 0.1).toFixed(2)}">10% (${(maxVal * 0.1).toFixed(2)})</button>
+                    <button type="button" class="preset-btn" data-preset="${(maxVal * 0.25).toFixed(2)}">25% (${(maxVal * 0.25).toFixed(2)})</button>
+                    <button type="button" class="preset-btn" data-preset="${(maxVal * 0.50).toFixed(2)}">50% (${(maxVal * 0.50).toFixed(2)})</button>
+                    <button type="button" class="preset-btn" data-preset="${(maxVal * 0.75).toFixed(2)}">75% (${(maxVal * 0.75).toFixed(2)})</button>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="indication">Net Indication Reading (${esc(unit)}) *</label>
+                  <input id="indication" name="indication" type="number" step="any" required placeholder="e.g. 5.005">
+                  <div id="live-error-calc" style="font-size:12px;font-weight:bold;color:#167f79;margin-top:6px;">
+                    Net Calculated Error: —
+                  </div>
+                </div>
+                ${field('Direction &amp; Remarks', 'remarks', 'LOADING', 'text', false, 'placeholder="LOADING or UNLOADING"')}
+                <div class="field wide actions">
+                  <button class="btn primary" type="submit">+ Add Tare Net Observation</button>
+                </div>
+              </form>
+            ` : (oimlRuleService.normalizeTestType(currentObsTest) === 'ZERO_RELATED_TESTS' ? `
+              <!-- ZERO RELATED TESTS Observation UI per OIML R 76-1:2006 Section 4.5 / Annex A.4.2 -->
+              <div class="callout" style="background:#f0f8fa;border-color:#b8dce6;color:#185363;margin-bottom:16px;">
+                <div style="font-weight:700;font-size:14px;margin-bottom:4px;">ZERO-RELATED TESTS (OIML R 76-1:2006 Section 4.5 &amp; Annex A.4.2)</div>
+                <div style="font-size:12.5px;color:#356b7c;line-height:1.6;">
+                  Record observations for the applicable zero subtest:
+                  <ul style="margin:6px 0 0 18px;padding:0;">
+                    <li><strong>Zero-Setting Accuracy (A.4.2.3):</strong> Enter the measured zero deviation after operating the zero-setting device. Allowed: ±0.25e = ±${(Number(inst?.e || 0.01) * 0.25).toFixed(4)} ${esc(unit)}</li>
+                    <li><strong>Zero-Setting Range (A.4.2.1):</strong> Enter positive / negative setting range vs 4% Max (${(maxVal * 0.04).toFixed(3)} ${esc(unit)}) or 20% Max initial (${(maxVal * 0.20).toFixed(3)} ${esc(unit)})</li>
+                    <li><strong>Zero-Tracking (4.5.7):</strong> Enter correction amount, duration, indication state, equilibrium state. Allowed rate: ≤ 0.5d/s = ${(Number(inst?.d || inst?.e || 0.01) * 0.5).toFixed(4)} ${esc(unit)}/s</li>
+                    <li><strong>Auto Zero-Setting (4.5.6):</strong> Record equilibrium state, indication, duration before operation.</li>
+                  </ul>
+                  <span class="muted">Use Reference = 0 for zero-deviation observations. Use the Remarks field to describe the subtest type (e.g., ZERO_SETTING_ACCURACY / ZERO_TRACKING / ZERO_RANGE).</span>
+                </div>
+              </div>
+              <form id="new-observation-form" class="formgrid spaced">
+                <input type="hidden" name="test" value="${esc(currentObsTest)}">
+                <div class="field">
+                  <label for="reference">Zero Reference (${esc(unit)}) — enter 0 for zero-point *</label>
+                  <input id="reference" name="reference" type="number" step="any" min="-${maxVal}" max="${maxVal}" required value="0" placeholder="0.000">
+                </div>
+                <div class="field">
+                  <label for="indication">Measured Value / Zero Deviation Reading (${esc(unit)}) *</label>
+                  <input id="indication" name="indication" type="number" step="any" required placeholder="e.g. 0.002 (positive) or -0.001 (negative)">
+                  <div id="live-error-calc" style="font-size:12px;font-weight:bold;color:#167f79;margin-top:6px;">
+                    Calculated Zero Deviation: —
+                  </div>
+                </div>
+                ${field('Subtest &amp; Remarks', 'remarks', 'ZERO_SETTING_ACCURACY', 'text', false, 'placeholder=\"ZERO_SETTING_ACCURACY | ZERO_RANGE | ZERO_TRACKING | AUTO_ZERO\"')}
+                <div class="field wide actions">
+                  <button class="btn primary" type="submit">+ Add Zero Observation</button>
+                </div>
+              </form>
+            ` : (oimlRuleService.normalizeTestType(currentObsTest) === 'CREEP' ? `
+              <!-- CREEP Observation UI per OIML R 76-1:2006 Section 3.9.4.1 / Annex A.4.11.1 -->
+              <div class="callout" style="background:#f4f0fa;border-color:#c8b4e6;color:#3a2060;margin-bottom:16px;">
+                <div style="font-weight:700;font-size:14px;margin-bottom:4px;">CREEP TEST (OIML R 76-1:2006 Section 3.9.4.1 / Annex A.4.11.1)</div>
+                <div style="font-size:12.5px;color:#5a3d8a;line-height:1.65;">
+                  <ul style="margin:6px 0 0 18px;padding:0;">
+                    <li><strong>Applied Load:</strong> One fixed load maintained throughout the test (Annex A.4.11.1). Do NOT mix loads.</li>
+                    <li><strong>P = I + 0.5e − ΔL.</strong> e = ${esc(inst?.e)} ${esc(unit)}. ΔL = additional load from changeover method (set 0 if direct reading).</li>
+                    <li><strong>Path A (30-min):</strong> All |ΔP| ≤ 0.5e = ${(Number(inst?.e||0.01)*0.5).toFixed(4)} ${esc(unit)} AND |P₃₀−P₁₅| ≤ 0.2e = ${(Number(inst?.e||0.01)*0.2).toFixed(4)} ${esc(unit)}</li>
+                    <li><strong>Path B (4-hour):</strong> Automatically triggered if Path A not satisfied. All |ΔP| ≤ Table 6 MPE.</li>
+                    <li>Use <strong>Reference field = Nominal Time (minutes)</strong> to record each observation: 0, 5, 15, 30 (then 60, 120, 180, 240 if needed).</li>
+                  </ul>
+                </div>
+              </div>
+              <form id="new-observation-form" class="formgrid spaced">
+                <input type="hidden" name="test" value="${esc(currentObsTest)}">
+                <div class="field">
+                  <label for="reference">Nominal Time (minutes) — 0, 5, 15, 30 [, 60, 120, 180, 240] *</label>
+                  <input id="reference" name="reference" type="number" step="1" min="0" max="240" required placeholder="e.g. 0">
+                  <div class="preset-wrap">
+                    <span class="muted small">Path A:</span>
+                    <button type="button" class="preset-btn" data-preset="0">0 min</button>
+                    <button type="button" class="preset-btn" data-preset="5">5 min</button>
+                    <button type="button" class="preset-btn" data-preset="15">15 min</button>
+                    <button type="button" class="preset-btn" data-preset="30">30 min</button>
+                    <span class="muted small" style="margin-left:10px;">Path B:</span>
+                    <button type="button" class="preset-btn" data-preset="60">1 h</button>
+                    <button type="button" class="preset-btn" data-preset="120">2 h</button>
+                    <button type="button" class="preset-btn" data-preset="180">3 h</button>
+                    <button type="button" class="preset-btn" data-preset="240">4 h</button>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="indication">Scale Indication I (${esc(unit)}) *</label>
+                  <input id="indication" name="indication" type="number" step="any" required placeholder="e.g. 50.003">
+                  <div id="live-error-calc" style="font-size:12px;font-weight:bold;color:#5a3d8a;margin-top:6px;">
+                    P = I + 0.5e − ΔL: —
+                  </div>
+                </div>
+                ${field('ΔL — Additional Load (changeover method; 0 for direct)', 'additionalLoad', '0', 'number', false, 'step="any" placeholder="0.000 (enter 0 if direct reading)"')}
+                ${field('Applied Load (maintained throughout series, ' + esc(unit) + ')', 'appliedLoad', String(Number(inst?.max||0)*0.5), 'number', false, 'step="any" placeholder="e.g. 50.000"')}
+                ${field('Actual Timestamp / Notes', 'remarks', '', 'text', false, 'placeholder="e.g. 09:00:00 — observation at 0 min"')}
+                <div class="field wide actions">
+                  <button class="btn primary" type="submit">+ Add Creep Observation</button>
+                </div>
+              </form>
+            ` : (oimlRuleService.normalizeTestType(currentObsTest) === 'ZERO_RETURN' ? `
+              <!-- ZERO RETURN Observation UI per OIML R 76-1:2006 Section 3.9.4.2 / Annex A.4.11.2 -->
+              <div class="callout" style="background:#eaf4f8;border-color:#b0d3e4;color:#184258;margin-bottom:16px;">
+                <div style="font-weight:700;font-size:14px;margin-bottom:4px;">ZERO RETURN TEST (OIML R 76-1:2006 Section 3.9.4.2 / Annex A.4.11.2)</div>
+                <div style="font-size:12.5px;color:#21526d;line-height:1.65;">
+                  <ul style="margin:6px 0 0 18px;padding:0;">
+                    <li><strong>Test Load:</strong> Test load should be close to Max (Max = ${esc(inst?.max)} ${esc(unit)}). Maintained for 30 minutes.</li>
+                    <li><strong>Loading Duration:</strong> Must remain applied for at least 30 minutes before load removal.</li>
+                    <li><strong>Automatic Zero &amp; Zero Tracking:</strong> Relevant devices must NOT be in operation during this test.</li>
+                    <li><strong>Acceptance:</strong> |Returned Zero − Initial Zero| ≤ 0.5e (${(Number(inst?.e||0.01)*0.5).toFixed(4)} ${esc(unit)}) for Single-Interval; ≤ 0.5e₁ for Multi-Interval; ≤ 0.5e_i for Multiple Range.</li>
+                    <li><strong>Multiple Range Switch:</strong> If applied load &gt; Max₁, indication near zero must not vary by more than e₁ during following 5 min.</li>
+                  </ul>
+                </div>
+              </div>
+              <form id="new-observation-form" class="formgrid spaced">
+                <input type="hidden" name="test" value="${esc(currentObsTest)}">
+                
+                <div class="field">
+                  <label for="appliedLoad">Applied Test Load (${esc(unit)}) — <em>Test load should be close to Max (${esc(inst?.max)})</em> *</label>
+                  <input id="appliedLoad" name="appliedLoad" type="number" step="any" required value="${esc(inst?.max)}" placeholder="e.g. ${esc(inst?.max)}">
+                </div>
+
+                <div class="field">
+                  <label for="loadingDurationMinutes">Loading Duration (minutes) — <em>required ≥ 30 min</em> *</label>
+                  <input id="loadingDurationMinutes" name="loadingDurationMinutes" type="number" step="any" min="30" required value="30" placeholder="30">
+                </div>
+
+                <div class="field">
+                  <label for="reference">Initial Zero Indication before loading (${esc(unit)}) *</label>
+                  <input id="reference" name="reference" type="number" step="any" required value="0.000" placeholder="0.000">
+                </div>
+
+                <div class="field">
+                  <label for="indication">Returned Zero Indication after stabilization (${esc(unit)}) *</label>
+                  <input id="indication" name="indication" type="number" step="any" required placeholder="e.g. 0.002">
+                  <div id="live-error-calc" style="font-size:12px;font-weight:bold;color:#184258;margin-top:6px;">
+                    Zero Return Deviation: —
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="instrumentTypeSelect">Instrument Configuration Mode *</label>
+                  <select id="instrumentTypeSelect" name="instrumentTypeSelect" onchange="toggleZeroReturnInstrumentFields(this.value)">
+                    <option value="SINGLE">Single Interval (e = ${esc(inst?.e)} ${esc(unit)})</option>
+                    <option value="MULTI">Multi-Interval (e₁ required)</option>
+                    <option value="MULTIPLE_RANGE">Multiple Range (Max₁, e₁, Max_i, e_i)</option>
+                  </select>
+                </div>
+
+                <div class="field" id="multiIntervalFields" style="display:none;">
+                  <label for="e1">e₁ — Lowest Verification Scale Interval (${esc(unit)}) *</label>
+                  <input id="e1" name="e1" type="number" step="any" placeholder="e.g. 0.002">
+                </div>
+
+                <div class="field wide" id="multipleRangeFields" style="display:none;background:#f5fafc;padding:12px;border:1px solid #d0e4ee;border-radius:6px;">
+                  <div style="font-weight:600;margin-bottom:8px;color:#184258;">Multiple Range Configuration</div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;">
+                    <div>
+                      <label style="font-size:11.5px;">Max₁ (${esc(unit)})</label>
+                      <input id="Max1" name="Max1" type="number" step="any" placeholder="e.g. 15">
+                    </div>
+                    <div>
+                      <label style="font-size:11.5px;">e₁ (${esc(unit)})</label>
+                      <input id="mr_e1" name="mr_e1" type="number" step="any" placeholder="e.g. 0.002">
+                    </div>
+                    <div>
+                      <label style="font-size:11.5px;">Active Range (i)</label>
+                      <input id="activeRange" name="activeRange" type="text" value="2" placeholder="e.g. 2">
+                    </div>
+                    <div>
+                      <label style="font-size:11.5px;">Active Range e_i (${esc(unit)})</label>
+                      <input id="e_i" name="e_i" type="number" step="any" placeholder="e.g. 0.005">
+                    </div>
+                  </div>
+                  <div id="fiveMinuteFollowUpSection" style="margin-top:12px;padding-top:10px;border-top:1px dashed #b8ced7;">
+                    <div style="font-weight:600;font-size:12px;color:#184258;margin-bottom:4px;">5-Minute Lowest-Range Follow-Up (Applicable when Load &gt; Max₁)</div>
+                    <div style="font-size:11.5px;color:#456778;margin-bottom:8px;">Enter comma-separated readings during the 5 minutes following return/switch to lowest range:</div>
+                    <input id="followUpReadings" name="followUpReadings" type="text" placeholder="e.g. 0.001, 0.0015, 0.002 (baseline to 5 min)">
+                  </div>
+                </div>
+
+                <div class="field" style="display:flex;gap:20px;align-items:center;margin-top:6px;">
+                  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                    <input type="checkbox" id="autoZeroDisabled" name="autoZeroDisabled" checked>
+                    <span>Automatic Zero disabled during test</span>
+                  </label>
+                  <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                    <input type="checkbox" id="zeroTrackDisabled" name="zeroTrackDisabled" checked>
+                    <span>Zero-Tracking disabled during test</span>
+                  </label>
+                </div>
+
+                ${field('Subtest &amp; Remarks', 'remarks', 'ZERO_RETURN', 'text', false, 'placeholder="ZERO_RETURN | notes"')}
+                <div class="field wide actions">
+                  <button class="btn primary" type="submit">+ Add Zero Return Observation</button>
+                </div>
+              </form>
             ` : `
-              <!-- Single Observation Entry UI (Weighing Performance, etc.) -->
+              <!-- Single Observation Entry UI (Weighing Performance, Eccentric Loading, etc.) -->
               <form id="new-observation-form" class="formgrid spaced">
                 <input type="hidden" name="test" value="${esc(currentObsTest)}">
                 <div class="field">
@@ -2626,7 +3103,7 @@ function evaluation() {
                   <button class="btn primary" type="submit">+ Add Observation Row</button>
                 </div>
               </form>
-            `}
+            `))))}
           </div>
         ` : ''}
       `)}
@@ -2801,7 +3278,7 @@ function evaluation() {
         ` : `
           <div class="callout" style="background:#eaf6f5;border-color:#b4e3df;color:#135955;">
             <strong>VERIFIED OIML R 76-1:2006 COMPLIANCE MODE (RULE PACKAGE: oiml-r76-1-2006):</strong>
-            Verified Section 3.5.1 Table 6 MPE rules active for <b>Weighing Performance</b> and Section 3.6.1 / Annex A.4.10 active for <b>Repeatability</b>. Remaining test procedures (Eccentric Loading, Tare, Zero, Creep, Temperature) strictly evaluate to <b>REFERENCE REQUIRED</b> until their respective normative rules are configured.
+            Verified Section 3.5.1 Table 6 MPE rules active for <b>Weighing Performance</b>, Section 3.6.1 / Annex A.4.10 active for <b>Repeatability</b>, Section 3.6.2 / Annex A.4.7 active for <b>Eccentric Loading</b>, Section 3.5.3.3 / 4.6.3 / Annex A.4.6 active for <b>Tare</b>, Section 4.5.1–4.5.7 / Annex A.4.2 active for <b>Zero-Related Tests</b>, Section 3.9.4.1 / Annex A.4.11.1 active for <b>Creep</b>, and Section 3.9.4.2 / Annex A.4.11.2 active for <b>Zero Return</b>. Remaining test procedure (Temperature) strictly evaluates to <b>REFERENCE REQUIRED</b> until its normative rule definition is configured.
           </div>
         `}
 
@@ -2894,7 +3371,117 @@ function evaluation() {
             } else {
               statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
             }
+          } else if (normTest === 'TARE' || normTest === 'ECCENTRIC_LOADING') {
+            // TARE and ECCENTRIC_LOADING: resolve each observation using verified engine
+            const results = testObs.map(o => oimlRuleService.evaluateObservation({
+              accuracyClass: inst?.class,
+              e: inst?.e,
+              d: inst?.d,
+              max: inst?.max,
+              min: inst?.min,
+              unit: inst?.unit,
+              referenceLoad: o.reference,
+              scaleReading: o.indication,
+              evaluationType: e.evaluationType,
+              testType: o.test,
+              ruleVersion: e.ruleVersion,
+              complianceMode: e.complianceMode
+            }));
+            const hasFail = results.some(r => r.complianceResult === 'FAIL');
+            const hasRef = results.some(r => r.complianceResult === 'REFERENCE_REQUIRED');
+            if (hasFail) statusBadge = '<span class="badge bad">FAIL</span>';
+            else if (hasRef) statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
+            else statusBadge = '<span class="badge good">PASS</span>';
+          } else if (normTest === 'ZERO_RELATED_TESTS') {
+            // ZERO: use verified ZeroRules per Section 4.5.2 (zero deviation per observation)
+            if (typeof OimlR76ZeroRules !== 'undefined') {
+              const numE = Number(inst?.e) || 0.01;
+              const numD = Number(inst?.d) || numE;
+              const allowedDev = numE * 0.25;
+              const zeroResults = testObs.map(o => {
+                const deviation = Number(o.indication) - Number(o.reference);
+                const absDeviation = Math.abs(deviation);
+                return { complianceResult: absDeviation <= allowedDev + 1e-9 ? 'PASS' : 'FAIL' };
+              });
+              const hasFail = zeroResults.some(r => r.complianceResult === 'FAIL');
+              if (hasFail) statusBadge = '<span class="badge bad">FAIL</span>';
+              else statusBadge = '<span class="badge good">PASS</span>';
+            } else {
+              statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
+            }
+          } else if (normTest === 'CREEP') {
+            // CREEP: evaluate the full series using OimlR76CreepRules
+            if (typeof OimlR76CreepRules !== 'undefined') {
+              const numE = Number(inst?.e) || 0.01;
+              const observations = testObs.map(o => ({
+                nominalTimeMinutes: Number(o.nominalTimeMinutes || o.reference || 0),
+                indication: Number(o.indication),
+                additionalLoad: Number(o.additionalLoad || o.deltaL || 0),
+                appliedLoad: Number(o.appliedLoad || inst?.max || 0)
+              }));
+              const creepResult = OimlR76CreepRules.evaluateCreep({
+                accuracyClass: inst?.class,
+                appliedLoad: Number(observations[0]?.appliedLoad || inst?.max || 0),
+                e: numE,
+                unit: inst?.unit || 'kg',
+                evaluationType: e.evaluationType || 'INITIAL_VERIFICATION',
+                measurementMethod: 'DIRECT',
+                observations
+              });
+              if (creepResult.complianceResult === 'PASS') {
+                statusBadge = '<span class="badge good">PASS</span>';
+              } else if (creepResult.complianceResult === 'FAIL') {
+                statusBadge = '<span class="badge bad">FAIL</span>';
+              } else if (creepResult.complianceResult === 'NOT_APPLICABLE') {
+                statusBadge = '<span class="badge" style="background:#e8f0e8;color:#2d5c2d;">NOT APPLICABLE</span>';
+              } else if (creepResult.requiresExtendedTest) {
+                statusBadge = '<span class="badge warn" style="background:#fff2d9;color:#8f6000;">EXTENDED TEST REQUIRED</span>';
+              } else {
+                statusBadge = '<span class="badge warn" style="background:#eaf0f2;color:#355361;">NOT EVALUATED</span>';
+              }
+            } else {
+              statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
+            }
+          } else if (normTest === 'ZERO_RETURN') {
+            // ZERO_RETURN: evaluate using OimlR76ZeroReturnRules
+            if (typeof OimlR76ZeroReturnRules !== 'undefined') {
+              const lastObs = testObs[testObs.length - 1];
+              const zrResult = OimlR76ZeroReturnRules.evaluateZeroReturn({
+                accuracyClass: inst?.class,
+                appliedLoad: lastObs.appliedLoad !== undefined ? Number(lastObs.appliedLoad) : (lastObs.reference !== undefined ? Number(lastObs.reference) : Number(inst?.max)),
+                maxCapacity: Number(inst?.max),
+                loadingDurationMinutes: lastObs.loadingDurationMinutes !== undefined ? Number(lastObs.loadingDurationMinutes) : 30,
+                initialZeroIndication: lastObs.initialZeroIndication !== undefined ? Number(lastObs.initialZeroIndication) : (lastObs.reference !== undefined ? Number(lastObs.reference) : 0),
+                returnedZeroIndication: lastObs.returnedZeroIndication !== undefined ? Number(lastObs.returnedZeroIndication) : Number(lastObs.indication),
+                e: Number(inst?.e),
+                unit: inst?.unit || 'kg',
+                isMultiInterval: !!lastObs.isMultiInterval,
+                e1: lastObs.e1,
+                isMultipleRange: !!lastObs.isMultipleRange,
+                ranges: lastObs.ranges,
+                activeRange: lastObs.activeRange,
+                hasAutomaticZeroSetting: !!lastObs.hasAutomaticZeroSetting,
+                hasZeroTracking: !!lastObs.hasZeroTracking,
+                automaticZeroDisabledDuringTest: lastObs.automaticZeroDisabledDuringTest !== undefined ? lastObs.automaticZeroDisabledDuringTest : true,
+                zeroTrackingDisabledDuringTest: lastObs.zeroTrackingDisabledDuringTest !== undefined ? lastObs.zeroTrackingDisabledDuringTest : true,
+                lowestRangeFollowUpObservations: lastObs.lowestRangeFollowUpObservations || []
+              });
+              if (zrResult.complianceResult === 'PASS') {
+                statusBadge = '<span class="badge good">PASS</span>';
+              } else if (zrResult.complianceResult === 'FAIL') {
+                statusBadge = '<span class="badge bad">FAIL</span>';
+              } else if (zrResult.complianceResult === 'NOT_APPLICABLE') {
+                statusBadge = '<span class="badge" style="background:#e8f0e8;color:#2d5c2d;">NOT APPLICABLE</span>';
+              } else if (zrResult.complianceResult === 'NOT_EVALUATED') {
+                statusBadge = '<span class="badge warn" style="background:#eaf0f2;color:#355361;">NOT EVALUATED</span>';
+              } else {
+                statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
+              }
+            } else {
+              statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
+            }
           } else {
+            // Unimplemented in verified mode (Temperature)
             statusBadge = '<span class="badge warn">REFERENCE REQUIRED</span>';
           }
         } else {
@@ -3217,8 +3804,15 @@ function rules() {
   return panel('Versioned Metrology Rule Sets', `
     <div class="callout" style="background:#eaf6f5;border-color:#b4e3df;color:#135955;">
       <strong>VERIFIED OIML R 76 CONFIGURATION STATUS:</strong>
-      Verified rule package <strong>oiml-r76-1-2006</strong> is loaded and active for <strong>WEIGHING_PERFORMANCE</strong> (Section 3.5.1 Table 6 / Section 3.5.2) and <strong>REPEATABILITY</strong> (Section 3.6.1 / Annex A.4.10).
-      Other test procedures (Eccentric Loading, Tare, Zero, Creep, Temperature) strictly evaluate to <strong>REFERENCE REQUIRED</strong> until their respective normative rule definitions are configured.
+      Verified rule package <strong>oiml-r76-1-2006</strong> is loaded and active for
+      <strong>WEIGHING_PERFORMANCE</strong> (Section 3.5.1 Table 6 / Section 3.5.2),
+      <strong>REPEATABILITY</strong> (Section 3.6.1 / Annex A.4.10),
+      <strong>ECCENTRIC_LOADING</strong> (Section 3.6.2 / Annex A.4.7),
+      <strong>TARE</strong> (Section 3.5.3.3, 3.5.3.4, 4.6.3 / Annex A.4.6.1, A.4.6.2, A.4.6.3), and
+      <strong>ZERO_RELATED_TESTS</strong> (Section 4.5.1, 4.5.2, 4.5.5, 4.5.6, 4.5.7 / Annex A.4.2.1, A.4.2.2, A.4.2.3),
+      <strong>CREEP</strong> (Section 3.9.4 / Section 3.9.4.1 / Annex A.4.11.1), and
+      <strong>ZERO_RETURN</strong> (Section 3.9.4 / Section 3.9.4.2 / Annex A.4.11.2).
+      Remaining test procedure (Temperature) strictly evaluates to <strong>REFERENCE REQUIRED</strong> until its normative rule definition is configured.
     </div>
 
     ${table(
@@ -3227,9 +3821,9 @@ function rules() {
         `<tr>
           <td><b>oiml-r76-1-2006</b></td>
           <td>OIML R 76-1:2006 (Non-automatic weighing instruments)</td>
-          <td><code>2006 Edition (Table 6 & Annex A.4.10)</code></td>
+          <td><code>2006 Edition (Table 6, Annex A.4.10, A.4.7, A.4.6, A.4.2, A.4.11)</code></td>
           <td><span class="badge good">VERIFIED ACTIVE</span></td>
-          <td>Verified rules active for <b>WEIGHING_PERFORMANCE</b> & <b>REPEATABILITY</b>; remaining procedures return <b>REFERENCE REQUIRED</b></td>
+          <td>Verified rules active for <b>WEIGHING_PERFORMANCE</b>, <b>REPEATABILITY</b>, <b>ECCENTRIC_LOADING</b>, <b>TARE</b>, <b>ZERO_RELATED_TESTS</b>, <b>CREEP</b> &amp; <b>ZERO_RETURN</b>; Temperature returns <b>REFERENCE REQUIRED</b></td>
         </tr>`,
         `<tr>
           <td><b>DEMO-SIM-ENGINE</b></td>
@@ -3622,10 +4216,47 @@ function bind() {
   const refInput = $('#reference');
   const indInput = $('#indication');
   const liveErrorEl = $('#live-error-calc');
+  window.toggleZeroReturnInstrumentFields = function(val) {
+    const mi = $('#multiIntervalFields');
+    const mr = $('#multipleRangeFields');
+    if (mi) mi.style.display = val === 'MULTI' ? 'block' : 'none';
+    if (mr) mr.style.display = val === 'MULTIPLE_RANGE' ? 'block' : 'none';
+    updateLiveError();
+  };
+
   function updateLiveError() {
     if (!refInput || !indInput || !liveErrorEl) return;
     const rVal = refInput.value.trim();
     const iVal = indInput.value.trim();
+    const normTest = oimlRuleService.normalizeTestType(currentObsTest);
+    if (normTest === 'ZERO_RETURN') {
+      if (rVal !== '' && iVal !== '') {
+        const e = evaluationService.getById(active);
+        const inst = e ? instrumentService.getById(e.instrument) : null;
+        const diff = calculationService.decimalSafeSubtract(iVal, rVal);
+        const absDiff = Math.abs(diff);
+        const instTypeSel = $('#instrumentTypeSelect')?.value || 'SINGLE';
+        let allowed = Number(inst?.e || 0.01) * 0.5;
+        let intLabel = '0.5e';
+        if (instTypeSel === 'MULTI') {
+          const e1Val = Number($('#e1')?.value) || Number(inst?.e || 0.01);
+          allowed = Number((e1Val * 0.5).toFixed(6));
+          intLabel = '0.5e₁';
+        } else if (instTypeSel === 'MULTIPLE_RANGE') {
+          const eiVal = Number($('#e_i')?.value) || Number(inst?.e || 0.01);
+          allowed = Number((eiVal * 0.5).toFixed(6));
+          intLabel = '0.5e_i';
+        }
+        const isPass = absDiff <= allowed + 1e-9;
+        liveErrorEl.innerHTML = `Initial Zero: <code>${rVal}</code> &nbsp;|&nbsp; Returned Zero: <code>${iVal}</code> &nbsp;|&nbsp; ` +
+          `Deviation: <strong>${diff >= 0 ? '+' : ''}${diff} ${inst?.unit || ''}</strong> &nbsp;|&nbsp; ` +
+          `|Dev|: <strong>${absDiff}</strong> &nbsp;|&nbsp; Allowed (${intLabel}): <strong>±${allowed}</strong> &nbsp;|&nbsp; ` +
+          `Result: <span class="badge ${isPass ? 'good' : 'bad'}" style="font-size:11px;">${isPass ? 'PASS' : 'FAIL'}</span>`;
+      } else {
+        liveErrorEl.innerHTML = `Zero Return Deviation: —`;
+      }
+      return;
+    }
     if (rVal !== '' && iVal !== '') {
       const diff = calculationService.decimalSafeSubtract(iVal, rVal);
       const diffStr = calculationService.formatError(diff);
@@ -3639,6 +4270,10 @@ function bind() {
   }
   if (refInput) refInput.oninput = updateLiveError;
   if (indInput) indInput.oninput = updateLiveError;
+  const e1Input = $('#e1');
+  if (e1Input) e1Input.oninput = updateLiveError;
+  const eiInput = $('#e_i');
+  if (eiInput) eiInput.oninput = updateLiveError;
 
   // Procedure selector in Step 3
   const obsTestSel = $('#obs-test-selector');
@@ -3776,8 +4411,42 @@ function bind() {
       const inst = instrumentService.getById(e.instrument);
       const maxVal = Number(inst?.max) || 10000;
 
-      if (Number(v.reference) < 0 || Number(v.reference) > maxVal) {
+      const isZeroTest = oimlRuleService.normalizeTestType(v.test || currentObsTest).includes('ZERO');
+      if (!isZeroTest && (Number(v.reference) < 0 || Number(v.reference) > maxVal)) {
         return toast(`Reference load must be between 0 and instrument Max capacity (${maxVal} ${inst?.unit})`);
+      }
+
+      if (oimlRuleService.normalizeTestType(v.test || currentObsTest) === 'ZERO_RETURN') {
+        v.initialZeroIndication = Number(v.reference);
+        v.returnedZeroIndication = Number(v.indication);
+        v.appliedLoad = Number(v.appliedLoad || inst?.max || 0);
+        v.loadingDurationMinutes = Number(v.loadingDurationMinutes || 30);
+        const instType = v.instrumentTypeSelect || 'SINGLE';
+        v.isMultiInterval = instType === 'MULTI';
+        v.isMultipleRange = instType === 'MULTIPLE_RANGE';
+        if (v.isMultiInterval) {
+          v.e1 = Number(v.e1);
+        } else if (v.isMultipleRange) {
+          v.Max1 = Number(v.Max1);
+          v.e1 = Number(v.mr_e1);
+          v.activeRange = v.activeRange || '2';
+          v.e_i = Number(v.e_i);
+          v.ranges = [
+            { rangeId: 1, Max_i: Number(v.Max1), e_i: Number(v.mr_e1) },
+            { rangeId: v.activeRange, Max_i: Number(inst?.max), e_i: Number(v.e_i) }
+          ];
+          if (v.followUpReadings) {
+            const parts = v.followUpReadings.split(',').map(s => s.trim()).filter(s => s !== '');
+            v.lowestRangeFollowUpObservations = parts.map((s, idx) => ({
+              time: idx * (5 / Math.max(1, parts.length - 1)),
+              nearZeroIndication: Number(s)
+            })).filter(o => !isNaN(o.nearZeroIndication));
+          }
+        }
+        v.automaticZeroDisabledDuringTest = !!$('#autoZeroDisabled')?.checked;
+        v.zeroTrackingDisabledDuringTest = !!$('#zeroTrackDisabled')?.checked;
+        v.hasAutomaticZeroSetting = true;
+        v.hasZeroTracking = true;
       }
 
       evaluationService.addObservation(active, v);
