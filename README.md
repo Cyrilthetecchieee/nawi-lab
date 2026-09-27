@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # NAWI Laboratory demo
 
 A browser-based demonstration of NAWI evaluation intake, observation entry, calculation traceability, review and printable demo reports.
@@ -16,3 +17,6 @@ Open `dist/index.html` in a browser or serve `dist/` with a local static server,
 - All seed observations are synthetic demonstration data. Do not use the site for laboratory or regulatory decisions.
 
 The source for the published Site is in `dist/`. The `.openai/hosting.json` file associates it with the Site project.
+=======
+# nawi-lab
+>>>>>>> b82fad1c58fd3626cd66e1fd1dc945e5f3766e8c
