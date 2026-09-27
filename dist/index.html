@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#142c3b">
+  <title>NAWI Laboratory | Metrology Type Evaluation</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <div class="brand">
+      <span class="mark">N</span>
+      <div>NAWI <b>LABORATORY</b><small>Evaluation workspace</small></div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="sidefoot">
+      <strong>DEMO WORKSPACE</strong>
+      <p>Synthetic observations. Demonstrating full NAWI OIML R76 test report automation workflow.</p>
+    </div>
+  </aside>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">METROLOGY / TYPE EVALUATION</div>
+        <h1 id="title">Dashboard</h1>
+      </div>
+      <div class="head-actions">
+        <div class="global-search-wrap">
+          <input id="global-search" type="search" placeholder="🔍 Global search (Ctrl+K)..." aria-label="Global search">
+          <div id="global-search-results" class="search-dropdown" style="display:none;"></div>
+        </div>
+        <span class="demo-pill">DEMO · NOT FOR REGULATORY USE</span>
+        <select id="role" aria-label="Active role">
+          <option value="TESTER">TESTER</option>
+          <option value="REVIEWER">REVIEWER</option>
+          <option value="ADMIN">ADMIN</option>
+        </select>
+      </div>
+    </header>
+    <section id="content"></section>
+  </main>
+</div>
+<div id="toast" role="status"></div>
+<script src="./rules/oiml-r76-1-2006/metadata.js"></script>
+<script src="./rules/oiml-r76-1-2006/mpeRules.js"></script>
+<script src="./rules/oiml-r76-1-2006/repeatabilityRules.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

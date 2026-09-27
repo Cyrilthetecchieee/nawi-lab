@@ -1,0 +1,10 @@
+{
+  "name": "nawi-lab",
+  "version": "1.0.0",
+  "description": "NAWI Laboratory demo",
+  "scripts": {
+    "dev": "python -m http.server 8000 --directory dist",
+    "start": "python -m http.server 8000 --directory dist",
+    "test": "node tests/mpeRules.test.js && node tests/repeatabilityRules.test.js"
+  }
+}
